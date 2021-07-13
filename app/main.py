@@ -1,8 +1,8 @@
-from uuid import uuid4
-import asyncio
-
-from fastapi import FastAPI, BackgroundTasks
 import aioredis
+import asyncio
+from fastapi import FastAPI, BackgroundTasks
+import os
+from uuid import uuid4
 
 
 async def wait_for_cancel(conn: aioredis.Connection, task_id: str):
@@ -34,8 +34,11 @@ async def long_running_task(conn: aioredis.Connection, task_id: str):
 def get_redis():
     """ Helper to get a redis client.
     """
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
     return aioredis.from_url(
-        "redis://127.0.0.1", encoding="utf-8", decode_responses=True
+        redis_url,
+        encoding="utf-8",
+        decode_responses=True
     )
 
 
@@ -65,9 +68,9 @@ async def task_wrapper(task_id: str):
 app = FastAPI()
 
 
-@app.get("/start")
-def start(background_tasks: BackgroundTasks):
-    task_id = uuid4().hex
+@app.get("/start/{task_id}")
+def start(background_tasks: BackgroundTasks, task_id: str):
+    task_id = task_id or uuid4().hex
     background_tasks.add_task(task_wrapper, task_id)
     return {"task_id": task_id}
 

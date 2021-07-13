@@ -1,10 +1,19 @@
-version: "3.9"
+version: "3.6"
 services:
   web:
     build: .
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+    networks:
+      - backend
     ports:
       - "80:80"
   redis:
     image: redis
-    ports:
-      - "6379:6379"
+    networks:
+      - backend
+
+networks:
+  backend:
