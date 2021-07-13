@@ -1,19 +1,39 @@
 version: "3.6"
 services:
+
   web:
     build: .
     depends_on:
       - redis
     environment:
       - REDIS_URL=redis://redis:6379
+      - DASK_SCHEDULER=tcp://dask_scheduler:8786
     networks:
       - backend
     ports:
       - "80:80"
+    # command: ["uvicorn", "app.main:app", "--port", "80", "--reload"]
+
   redis:
     image: redis
     networks:
       - backend
+
+  dask_scheduler:
+    build: .
+    networks:
+      - backend
+    ports:
+      - "8786:8786"
+    command: ["dask-scheduler", "--host", "dask_scheduler", "--port", "8786"]
+
+  dask_worker:
+    build: .
+    depends_on:
+      - dask_scheduler
+    networks:
+      - backend
+    command: ["dask-worker", "--nthreads", "1", "--nprocs", "8", "tcp://dask_scheduler:8786"]
 
 networks:
   backend:

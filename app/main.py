@@ -1,8 +1,21 @@
 import aioredis
 import asyncio
+from dask.distributed import as_completed, Client
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.logger import logger
+import logging
 import os
+from random import random
+import time
 from uuid import uuid4
+
+
+uvicorn_logger = logging.getLogger("uvicorn.access")
+logger.handlers = uvicorn_logger.handlers
+if __name__ != "main":
+    logger.setLevel(uvicorn_logger.level)
+else:
+    logger.setLevel(logging.INFO)
 
 
 async def wait_for_cancel(conn: aioredis.Connection, task_id: str):
@@ -16,25 +29,89 @@ async def cancel_task(conn: aioredis.Connection, task_id: str):
     """ Send a task cancellation message. Does not check if the task is
         actually valid.
     """
+    logger.info(f"cancel task {task_id}")
     return await conn.lpush(f"cancel-{task_id}", "cancel")
+
+
+def tile_process(t=3, raise_exception=True, raise_at=9.9):
+    logger.info(f"sleep for {t}s")
+    time.sleep(t)
+    if raise_exception and t >= raise_at:
+        raise ValueError("random exception")
+    return f"processed in {round(t, 3)}s"
+
+
+def sync_mapchete_execute(tiles=500, max_wait=20, raise_exception=True):
+    """Simulates a blocking mapchete execute command."""
+    scheduler = os.environ.get("DASK_SCHEDULER")
+    if scheduler is None:
+        raise ValueError("DASK_SCHEDULER environment variable must be set")
+    times = [random() * max_wait for _ in range(tiles)]
+    with Client(scheduler, asynchronous=False) as client:
+        futures = client.map(
+            tile_process,
+            times,
+            batch_size=10,
+            raise_exception=raise_exception,
+            raise_at=max_wait * 0.95
+        )
+        logger.info(f"{len(futures)} tasks submitted")
+        i = 0
+        for f in as_completed(futures):
+            logger.info(f"tile {i + 1}/{tiles} {f.result()}")
+            i += 1
+
+
+async def async_mapchete_execute(tiles=500, max_wait=20, raise_exception=True):
+    """Simulates an asynchronous mapchete execute command."""
+    scheduler = os.environ.get("DASK_SCHEDULER")
+    if scheduler is None:
+        raise ValueError("DASK_SCHEDULER environment variable must be set")
+    times = [random() * max_wait for _ in range(tiles)]
+    with await Client(scheduler, asynchronous=True) as client:
+        futures = [
+            f for f in
+            client.map(
+                tile_process,
+                times,
+                batch_size=10,
+                raise_exception=raise_exception,
+                raise_at=max_wait * 0.95,
+            )
+        ]
+        logger.info(f"{len(futures)} tasks submitted")
+        i = 0
+        async for f in as_completed(futures):
+            logger.info(f"tile {i + 1}/{tiles} {await f.result()}")
+            i += 1
 
 
 async def long_running_task(conn: aioredis.Connection, task_id: str):
     """ Stub for the actual task to be performed
     """
     # set the initial status to "started"
+    logger.info("start long running task")
     try:
         await conn.set(f"status-{task_id}", "started")
-        await asyncio.sleep(10)
+
+        # sync_mapchete_execute(tiles=100, max_wait=10, raise_exception=False)
+        await async_mapchete_execute(tiles=100, max_wait=10, raise_exception=False)
+
         await conn.set(f"status-{task_id}", "finished")
     except asyncio.CancelledError:
+        logger.info("task cancelled!")
         await conn.set(f"status-{task_id}", "cancelled")
+    except Exception as e:
+        await conn.set(f"status-{task_id}", "failed")
+        logger.exception(e)
+        raise
 
 
 def get_redis():
     """ Helper to get a redis client.
     """
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+    logger.info(f"get redis from url {redis_url}")
     return aioredis.from_url(
         redis_url,
         encoding="utf-8",
@@ -47,7 +124,7 @@ async def task_wrapper(task_id: str):
         one for the actual processing, and one for the cancellation. The one
         finishing first triggers the cancellation of the other.
     """
-    print(f"Starting task {task_id}")
+    logger.info(f"Starting task {task_id}")
     redis = get_redis()
     async with redis.client() as conn, redis.client() as conn2:
         # create an asyncio.Task for both the actual task and the cancellation

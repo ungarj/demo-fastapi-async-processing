@@ -1,3 +1,5 @@
 aioredis==2.0.0a1
+dask
+distributed
 fastapi
 uvicorn
