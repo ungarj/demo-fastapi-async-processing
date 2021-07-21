@@ -9,20 +9,17 @@ from random import random
 import time
 from uuid import uuid4
 
+# this will be mapchete.commands.execute
+from .mapchete import execute as mapchete_execute
+
 
 uvicorn_logger = logging.getLogger("uvicorn.access")
 logger.handlers = uvicorn_logger.handlers
 if __name__ != "main":
-    logger.setLevel(uvicorn_logger.level)
+    # logger.setLevel(uvicorn_logger.level)
+    logger.setLevel(logging.DEBUG)
 else:
-    logger.setLevel(logging.INFO)
-
-
-async def wait_for_cancel(conn: aioredis.Connection, task_id: str):
-    """ This waits for a task cancellation message. Does not check if the task is
-        actually valid.
-    """
-    return await conn.brpop(f"cancel-{task_id}")
+    logger.setLevel(logging.DEBUG)
 
 
 async def cancel_task(conn: aioredis.Connection, task_id: str):
@@ -30,81 +27,8 @@ async def cancel_task(conn: aioredis.Connection, task_id: str):
         actually valid.
     """
     logger.info(f"cancel task {task_id}")
-    return await conn.lpush(f"cancel-{task_id}", "cancel")
-
-
-def tile_process(t=3, raise_exception=True, raise_at=9.9):
-    logger.info(f"sleep for {t}s")
-    time.sleep(t)
-    if raise_exception and t >= raise_at:
-        raise ValueError("random exception")
-    return f"processed in {round(t, 3)}s"
-
-
-def sync_mapchete_execute(tiles=500, max_wait=20, raise_exception=True):
-    """Simulates a blocking mapchete execute command."""
-    scheduler = os.environ.get("DASK_SCHEDULER")
-    if scheduler is None:
-        raise ValueError("DASK_SCHEDULER environment variable must be set")
-    times = [random() * max_wait for _ in range(tiles)]
-    with Client(scheduler, asynchronous=False) as client:
-        futures = client.map(
-            tile_process,
-            times,
-            batch_size=10,
-            raise_exception=raise_exception,
-            raise_at=max_wait * 0.95
-        )
-        logger.info(f"{len(futures)} tasks submitted")
-        i = 0
-        for f in as_completed(futures):
-            logger.info(f"tile {i + 1}/{tiles} {f.result()}")
-            i += 1
-
-
-async def async_mapchete_execute(tiles=500, max_wait=20, raise_exception=True):
-    """Simulates an asynchronous mapchete execute command."""
-    scheduler = os.environ.get("DASK_SCHEDULER")
-    if scheduler is None:
-        raise ValueError("DASK_SCHEDULER environment variable must be set")
-    times = [random() * max_wait for _ in range(tiles)]
-    with await Client(scheduler, asynchronous=True) as client:
-        futures = [
-            f for f in
-            client.map(
-                tile_process,
-                times,
-                batch_size=10,
-                raise_exception=raise_exception,
-                raise_at=max_wait * 0.95,
-            )
-        ]
-        logger.info(f"{len(futures)} tasks submitted")
-        i = 0
-        async for f in as_completed(futures):
-            logger.info(f"tile {i + 1}/{tiles} {await f.result()}")
-            i += 1
-
-
-async def long_running_task(conn: aioredis.Connection, task_id: str):
-    """ Stub for the actual task to be performed
-    """
-    # set the initial status to "started"
-    logger.info("start long running task")
-    try:
-        await conn.set(f"status-{task_id}", "started")
-
-        # sync_mapchete_execute(tiles=100, max_wait=10, raise_exception=False)
-        await async_mapchete_execute(tiles=100, max_wait=10, raise_exception=False)
-
-        await conn.set(f"status-{task_id}", "finished")
-    except asyncio.CancelledError:
-        logger.info("task cancelled!")
-        await conn.set(f"status-{task_id}", "cancelled")
-    except Exception as e:
-        await conn.set(f"status-{task_id}", "failed")
-        logger.exception(e)
-        raise
+    # return await conn.lpush(f"cancel-{task_id}", "cancel")
+    return await conn.set(f"status-{task_id}", "abort")
 
 
 def get_redis():
@@ -120,27 +44,38 @@ def get_redis():
 
 
 async def task_wrapper(task_id: str):
-    """ Wrap a processing task to allow it beeing cancellable. Starts two futures,
-        one for the actual processing, and one for the cancellation. The one
-        finishing first triggers the cancellation of the other.
+    """ Create a Job iterator through the mapchete_execute function. On every new finished task,
+        check whether the task already got the abort status.
     """
     logger.info(f"Starting task {task_id}")
+    scheduler = os.environ.get("DASK_SCHEDULER")
+    if scheduler is None:
+        raise ValueError("DASK_SCHEDULER environment variable must be set")
     redis = get_redis()
-    async with redis.client() as conn, redis.client() as conn2:
-        # create an asyncio.Task for both the actual task and the cancellation
-        # task. This is required so that we can call `.cancel()` on that future
-        task_future = asyncio.create_task(long_running_task(conn, task_id))
-        cancel_future = asyncio.create_task(wait_for_cancel(conn2, task_id))
-
-        _, pending = await asyncio.wait(
-            [task_future, cancel_future],
-            return_when=asyncio.FIRST_COMPLETED
+    async with redis.client() as conn:
+        logger.debug("starting mapchete_execute")
+        await conn.set(f"status-{task_id}", "started")
+        # Mapchete now will initialize the process and prepare all the tasks required.
+        job = mapchete_execute(
+            None,
+            as_iterator=True,
+            concurrency="dask",
+            executor_kwargs=dict(dask_scheduler=scheduler)
         )
-
-        # cancel the "other" task
-        for future in pending:
-            future.cancel()
-
+        logger.debug(f"created {job}")
+        # By iterating through the Job object, mapchete will send all tasks to the dask cluster and
+        # yield the results.
+        for t in job:
+            # determine if there is a cancel signal for this task
+            logger.debug(f"looking for abort message")
+            status = await conn.get(f"status-{task_id}")
+            logger.debug(f"task status: {status}")
+            if status == "abort":
+                # By calling the job's cancel method, all pending futures will be cancelled.
+                job.cancel()
+                await conn.set(f"status-{task_id}", "cancelled")
+                break
+            # TODO update job state
 
 app = FastAPI()
 
@@ -148,6 +83,7 @@ app = FastAPI()
 @app.get("/start/{task_id}")
 def start(background_tasks: BackgroundTasks, task_id: str):
     task_id = task_id or uuid4().hex
+    # send task to background to be able to quickly return a message
     background_tasks.add_task(task_wrapper, task_id)
     return {"task_id": task_id}
 
