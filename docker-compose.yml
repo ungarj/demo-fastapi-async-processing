@@ -11,8 +11,8 @@ services:
     networks:
       - backend
     ports:
-      - "80:80"
-    # command: ["uvicorn", "app.main:app", "--port", "80", "--reload"]
+      - 80:8000
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "debug"]
 
   redis:
     image: redis

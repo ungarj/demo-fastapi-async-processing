@@ -2,5 +2,5 @@ aioredis==2.0.0a1
 cached_property
 dask
 distributed
-fastapi
+fastapi==0.66
 uvicorn
